@@ -65,7 +65,7 @@ async function getResource(endpoint, shareUrl, signal) {
   }, signal)
 }
 
-async function getDownload(href, signal) {
+async function getDownload(href, signal, range) {
   let url = typeof href === 'string' ? URL.parse(href) : null
   for (let redirects = 0; redirects <= 4; redirects++) {
     const host = url?.hostname
@@ -76,24 +76,64 @@ async function getDownload(href, signal) {
 
     // The request timeout covers headers. The overall deadline covers the video body.
     const response = await retryNetwork(attemptSignal =>
-      fetch(url, { redirect: 'manual', signal: attemptSignal }), signal)
+      fetch(url, {
+        redirect: 'manual',
+        signal: attemptSignal,
+        headers: range ? { Range: range, 'Accept-Encoding': 'identity' } : undefined,
+      }), signal)
     if (redirectStatuses.has(response.status)) {
       const location = response.headers.get('location')
       await response.body?.cancel()
       url = location ? URL.parse(location, url) : null
       continue
     }
-    if (response.status !== 200 || !response.body) await rejectResponse(response)
+    if (response.status !== (range ? 206 : 200) || !response.body) await rejectResponse(response)
     return response
   }
   throw new VideoValidationError(502, 'Яндекс Диск вернул неподдерживаемый адрес скачивания.')
 }
 
+async function saveRanges(href, path, size, signal) {
+  const chunkSize = 1024 * 1024
+  async function* readRanges() {
+    for (let start = 0; start < size; start += chunkSize) {
+      const end = Math.min(start + chunkSize, size) - 1
+      const bytes = await retryNetwork(async attemptSignal => {
+        const response = await getDownload(href, attemptSignal, `bytes=${start}-${end}`)
+        if (response.headers.get('content-range') !== `bytes ${start}-${end}/${size}`) {
+          await response.body.cancel()
+          throw new VideoValidationError(502, 'Яндекс Диск вернул неверный диапазон байтов.')
+        }
+        const chunkBuffer = Buffer.allocUnsafe(end - start + 1)
+        let received = 0
+        for await (const chunk of response.body) {
+          if (received + chunk.byteLength > chunkBuffer.length) {
+            throw new VideoValidationError(502, 'Яндекс Диск вернул лишние данные.')
+          }
+          chunkBuffer.set(chunk, received)
+          received += chunk.byteLength
+        }
+        if (received !== chunkBuffer.length) throw new VideoValidationError(502, 'Яндекс Диск вернул неполный файл.')
+        return chunkBuffer
+      }, signal)
+      yield bytes
+    }
+  }
+  try {
+    await pipeline(readRanges, createWriteStream(path, { flags: 'wx' }), { signal })
+    return size
+  } catch (error) {
+    if (error.code !== 'EEXIST') await rm(path, { force: true })
+    throw error
+  }
+}
+
 async function saveDownload(href, path, signal, checkSize) {
   for (let attempt = 1; ; attempt++) {
     const response = await getDownload(href, signal)
+    const expected = Number(response.headers.get('content-length'))
     try {
-      checkSize(Number(response.headers.get('content-length')))
+      checkSize(expected)
     } catch (error) {
       await response.body.cancel()
       throw error
@@ -122,6 +162,10 @@ async function saveDownload(href, path, signal, checkSize) {
     } catch (error) {
       if (error.code !== 'EEXIST') await rm(path, { force: true })
       if (signal.aborted || attempt >= 2 || (!idle.signal.aborted && !isTransient(error))) throw error
+      if (Number.isSafeInteger(expected) && expected > 0
+        && response.headers.get('accept-ranges') === 'bytes') {
+        return saveRanges(href, path, expected, signal)
+      }
     } finally {
       clearTimeout(idleTimer)
     }
