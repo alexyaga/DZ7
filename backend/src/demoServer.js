@@ -56,10 +56,19 @@ app.post('/api/demo/jobs', express.json({ limit: '4kb' }), async (request, respo
     }
 
     const id = randomUUID()
-    const job = { status: 'processing', stage: 'downloading', transcript: null, summary: null, error: null }
+    const job = {
+      filename: null,
+      createdAt: new Date().toISOString(),
+      status: 'processing',
+      stage: 'downloading',
+      transcript: null,
+      summary: null,
+      error: null,
+      expiresAt: null,
+    }
     jobs.set(id, job)
     void processDemoJob(id, url, job)
-    return response.status(202).json({ id })
+    return response.status(202).json({ id, createdAt: job.createdAt })
   } catch (error) {
     if (error instanceof VideoValidationError) return response.status(error.status).json({ error: error.message })
     console.error('Could not accept demo job:', error.code ?? error.name)
@@ -67,11 +76,25 @@ app.post('/api/demo/jobs', express.json({ limit: '4kb' }), async (request, respo
   }
 })
 
-app.get('/api/demo/result', (request, response) => {
+function requireDemoJob(request, response, next) {
   const token = /^Bearer ([a-f0-9-]{36})$/.exec(request.get('Authorization') ?? '')?.[1]
   const job = jobs.get(token)
   if (!job) return response.status(404).json({ error: 'Результат недоступен или срок хранения истёк.' })
-  return response.json(job)
+  response.locals.demoJob = job
+  response.locals.demoToken = token
+  return next()
+}
+
+app.get('/api/demo/result', requireDemoJob, (_request, response) => {
+  return response.json(response.locals.demoJob)
+})
+
+app.delete('/api/demo/result', requireDemoJob, (_request, response) => {
+  if (response.locals.demoJob.status === 'processing') {
+    return response.status(409).json({ error: 'Дождитесь завершения обработки встречи.' })
+  }
+  jobs.delete(response.locals.demoToken)
+  return response.status(204).end()
 })
 
 app.use((error, _request, response, next) => {
@@ -84,7 +107,10 @@ async function processDemoJob(id, url, job) {
   const videoPath = join(tempDir, id)
   const signal = AbortSignal.timeout(330_000)
   try {
-    const file = await downloadYandexVideo(url, videoPath, signal, undefined, { maxBytes })
+    const file = await downloadYandexVideo(url, videoPath, signal, undefined, {
+      maxBytes,
+      onFilename: filename => { job.filename = filename },
+    })
     job.stage = 'validating'
     const { durationSeconds } = await validateVideo(file, videoExtension(file.originalname), signal)
     if (durationSeconds > maxDurationSeconds) {
@@ -99,6 +125,7 @@ async function processDemoJob(id, url, job) {
     job.error = error instanceof VideoValidationError ? error.message : 'Не удалось обработать запись.'
     if (!(error instanceof VideoValidationError)) console.error('Demo processing failed:', error.code ?? error.name)
   } finally {
+    job.expiresAt = new Date(Date.now() + resultLifetimeMs).toISOString()
     accepting = false
     setTimeout(() => jobs.delete(id), resultLifetimeMs).unref()
   }

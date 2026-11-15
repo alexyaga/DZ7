@@ -172,7 +172,7 @@ async function saveDownload(href, path, signal, checkSize) {
   }
 }
 
-export async function downloadYandexVideo(link, path, signal, findDuplicate, { maxBytes = maxVideoBytes } = {}) {
+export async function downloadYandexVideo(link, path, signal, findDuplicate, { maxBytes = maxVideoBytes, onFilename } = {}) {
   const shareUrl = parseShareUrl(link)
   function checkSize(bytes) {
     if (bytes > maxBytes) throw new VideoValidationError(413, `Размер видео превышает ${maxBytes / 1_000_000} МБ.`)
@@ -184,6 +184,7 @@ export async function downloadYandexVideo(link, path, signal, findDuplicate, { m
     if (metadata?.type !== 'file' || typeof metadata.name !== 'string') {
       throw new VideoValidationError(422, 'Ссылка должна вести на один файл, а не на папку.')
     }
+    onFilename?.(metadata.name)
     videoExtension(metadata.name)
     checkSize(metadata.size)
     const yandexResourceId = typeof metadata.resource_id === 'string' && metadata.resource_id
