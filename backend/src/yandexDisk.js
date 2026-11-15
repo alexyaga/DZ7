@@ -2,11 +2,38 @@ import { createWriteStream } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
+import { setTimeout as wait } from 'node:timers/promises'
 import { maxVideoBytes, videoExtension, VideoValidationError } from './videoValidation.js'
 
 const publicApi = 'https://cloud-api.yandex.net/v1/disk/public/resources'
 const shareHosts = ['disk.yandex.ru', 'disk.yandex.com', 'yadi.sk']
 const redirectStatuses = new Set([301, 302, 303, 307, 308])
+const transientNetworkCodes = new Set([
+  'EAI_AGAIN', 'ECONNRESET', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET',
+])
+
+function isTransient(error) {
+  return transientNetworkCodes.has(error.cause?.code ?? error.code)
+    || (error instanceof AggregateError && error.errors.some(isTransient))
+}
+
+async function retryNetwork(operation, signal) {
+  for (let attempt = 1; ; attempt++) {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 15_000)
+    try {
+      try {
+        return await operation(AbortSignal.any([signal, controller.signal]))
+      } finally {
+        clearTimeout(timeout)
+      }
+    } catch (error) {
+      if (signal.aborted || attempt >= 4 || (!controller.signal.aborted && !isTransient(error))) throw error
+      await wait(attempt * 400, undefined, { signal })
+    }
+  }
+}
 
 export function parseShareUrl(value) {
   const url = typeof value === 'string' && value.length <= 2048 ? URL.parse(value.trim()) : null
@@ -31,9 +58,11 @@ async function rejectResponse(response) {
 async function getResource(endpoint, shareUrl, signal) {
   const url = new URL(endpoint)
   url.searchParams.set('public_key', shareUrl)
-  const response = await fetch(url, { redirect: 'manual', signal })
-  if (!response.ok) await rejectResponse(response)
-  return response.json()
+  return retryNetwork(async attemptSignal => {
+    const response = await fetch(url, { redirect: 'manual', signal: attemptSignal })
+    if (!response.ok) await rejectResponse(response)
+    return response.json()
+  }, signal)
 }
 
 async function getDownload(href, signal) {
@@ -45,7 +74,9 @@ async function getDownload(href, signal) {
       || host === 'mds.storage.yandex.net'
     if (!trusted || url.protocol !== 'https:' || url.username || url.password || url.port) break
 
-    const response = await fetch(url, { redirect: 'manual', signal })
+    // The request timeout covers headers. The overall deadline covers the video body.
+    const response = await retryNetwork(attemptSignal =>
+      fetch(url, { redirect: 'manual', signal: attemptSignal }), signal)
     if (redirectStatuses.has(response.status)) {
       const location = response.headers.get('location')
       await response.body?.cancel()
@@ -58,6 +89,45 @@ async function getDownload(href, signal) {
   throw new VideoValidationError(502, 'Яндекс Диск вернул неподдерживаемый адрес скачивания.')
 }
 
+async function saveDownload(href, path, signal, checkSize) {
+  for (let attempt = 1; ; attempt++) {
+    const response = await getDownload(href, signal)
+    try {
+      checkSize(Number(response.headers.get('content-length')))
+    } catch (error) {
+      await response.body.cancel()
+      throw error
+    }
+
+    let size = 0
+    const idle = new AbortController()
+    const idleTimer = setTimeout(() => idle.abort(), 25_000)
+    const countBytes = new Transform({
+      transform(chunk, _encoding, done) {
+        idleTimer.refresh()
+        size += chunk.length
+        try {
+          checkSize(size)
+          done(null, chunk)
+        } catch (error) {
+          done(error)
+        }
+      },
+    })
+    try {
+      await pipeline(response.body, countBytes, createWriteStream(path, { flags: 'wx' }), {
+        signal: AbortSignal.any([signal, idle.signal]),
+      })
+      return size
+    } catch (error) {
+      if (error.code !== 'EEXIST') await rm(path, { force: true })
+      if (signal.aborted || attempt >= 2 || (!idle.signal.aborted && !isTransient(error))) throw error
+    } finally {
+      clearTimeout(idleTimer)
+    }
+  }
+}
+
 export async function downloadYandexVideo(link, path, signal, findDuplicate, { maxBytes = maxVideoBytes } = {}) {
   const shareUrl = parseShareUrl(link)
   function checkSize(bytes) {
@@ -65,7 +135,6 @@ export async function downloadYandexVideo(link, path, signal, findDuplicate, { m
   }
   const deadline = AbortSignal.timeout(300_000)
   const downloadSignal = AbortSignal.any([signal, deadline])
-  let outputStarted = false
   try {
     const metadata = await getResource(publicApi, shareUrl, downloadSignal)
     if (metadata?.type !== 'file' || typeof metadata.name !== 'string') {
@@ -82,34 +151,14 @@ export async function downloadYandexVideo(link, path, signal, findDuplicate, { m
       if (duplicate) return { duplicate }
     }
     const { href } = await getResource(publicApi + '/download', shareUrl, downloadSignal)
-    const response = await getDownload(href, downloadSignal)
-    try {
-      checkSize(Number(response.headers.get('content-length')))
-    } catch (error) {
-      await response.body.cancel()
-      throw error
-    }
-
-    let size = 0
-    const countBytes = new Transform({
-      transform(chunk, _encoding, done) {
-        size += chunk.length
-        try {
-          checkSize(size)
-          done(null, chunk)
-        } catch (error) {
-          done(error)
-        }
-      },
-    })
-    outputStarted = true
-    await pipeline(response.body, countBytes, createWriteStream(path, { flags: 'wx' }), { signal: downloadSignal })
+    const size = await saveDownload(href, path, downloadSignal, checkSize)
     return { path, size, originalname: metadata.name, yandexResourceId }
   } catch (error) {
-    if (outputStarted && error.code !== 'EEXIST') await rm(path, { force: true })
     if (error instanceof VideoValidationError || signal.aborted) throw error
     if (deadline.aborted) throw new VideoValidationError(504, 'Скачивание с Яндекс Диска заняло больше 5 минут.')
     if (['ENOSPC', 'EACCES', 'EPERM'].includes(error.code)) throw error
+    const code = error.cause?.code ?? error.code ?? error.name
+    console.warn('Yandex Disk download failed:', code)
     throw new VideoValidationError(502, 'Не удалось скачать видео с Яндекс Диска.')
   }
 }
