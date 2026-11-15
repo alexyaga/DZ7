@@ -4,6 +4,7 @@ import { mkdir, readdir, readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import cors from 'cors'
 import express from 'express'
+import multer from 'multer'
 import writeFileAtomic from 'write-file-atomic'
 import { analyzeMeeting, removeMeetingFiles } from './meetingProcessor.js'
 import { validateVideo, videoExtension, VideoValidationError } from './videoValidation.js'
@@ -31,6 +32,23 @@ let accepting = false
 let ready = false
 let quota = { day: '', count: 0 }
 
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (_request, _file, callback) => callback(null, tempDir),
+    filename: (_request, _file, callback) => callback(null, randomUUID()),
+  }),
+  limits: { fileSize: maxBytes, files: 1, fields: 0, parts: 1 },
+  defParamCharset: 'utf8',
+  fileFilter(_request, file, callback) {
+    try {
+      videoExtension(file.originalname)
+    } catch (error) {
+      return callback(error)
+    }
+    return callback(null, true)
+  },
+}).single('video')
+
 const app = express()
 app.disable('x-powered-by')
 app.use(cors({ origin: clientOrigin }))
@@ -45,57 +63,80 @@ app.use((request, response, next) => {
 app.get('/api/demo/health', (_request, response) => response.json({ status: 'ok' }))
 
 app.post('/api/demo/jobs', express.json({ limit: '4kb' }), async (request, response) => {
-  try {
-    const url = parseShareUrl(request.body?.url)
-    const knownIds = Array.isArray(request.body?.knownIds) ? request.body.knownIds : []
-    // Look up only results whose private identifiers the browser already holds.
-    const duplicateId = knownIds.find(id => {
-      const job = jobs.get(id)
-      return job?.shareUrl === url
-        && (job.status !== 'error' || typeof job.transcript === 'string')
-        && (!job.expiresAt || Date.parse(job.expiresAt) > Date.now())
+  const shareUrl = parseShareUrl(request.body?.url)
+  const knownIds = Array.isArray(request.body?.knownIds) ? request.body.knownIds : []
+  // Look up only results whose private identifiers the browser already holds.
+  const duplicateId = knownIds.find(id => {
+    const job = jobs.get(id)
+    return job?.shareUrl === shareUrl
+      && (job.status !== 'error' || typeof job.transcript === 'string')
+      && (!job.expiresAt || Date.parse(job.expiresAt) > Date.now())
+  })
+  if (duplicateId) return response.json({ id: duplicateId, duplicate: true })
+
+  return acceptDemoJob(response, async () => ({ shareUrl }))
+})
+
+app.post('/api/demo/jobs/upload', (request, response) => {
+  if (!request.is('multipart/form-data')) {
+    return response.status(400).json({ error: 'Выберите видео для загрузки.' })
+  }
+  return acceptDemoJob(response, async () => {
+    await new Promise((resolveUpload, rejectUpload) => {
+      upload(request, response, error => {
+        if (!error) return resolveUpload()
+        if (error.code || error instanceof VideoValidationError) return rejectUpload(error)
+        return rejectUpload(new VideoValidationError(400, 'Не удалось прочитать форму загрузки.'))
+      })
     })
-    if (duplicateId) return response.json({ id: duplicateId, duplicate: true })
+    if (!request.file) throw new VideoValidationError(400, 'Выберите видео для загрузки.')
+    return { file: request.file }
+  })
+})
 
-    if (accepting) return response.status(409).json({ error: 'Сейчас обрабатывается другая запись. Попробуйте позже.' })
-    const now = new Date()
-    const day = now.toISOString().slice(0, 10)
-    const count = quota.day === day ? quota.count : 0
-    if (count >= currentDailyLimit(now)) {
-      return response.status(429).json({ error: 'Лимит демо на сегодня исчерпан. Готовый пример доступен ниже.' })
-    }
+async function acceptDemoJob(response, receiveSource) {
+  if (accepting) return response.status(409).json({ error: 'Сейчас обрабатывается другая запись. Попробуйте позже.' })
+  const now = new Date()
+  const day = now.toISOString().slice(0, 10)
+  const count = quota.day === day ? quota.count : 0
+  if (count >= currentDailyLimit(now)) {
+    return response.status(429).json({ error: 'Лимит демо на сегодня исчерпан. Готовый пример доступен ниже.' })
+  }
 
-    accepting = true
+  accepting = true
+  let accepted = false
+  let input
+  try {
+    input = await receiveSource()
+    if (response.destroyed) return
     const nextQuota = { day, count: count + 1 }
-    try {
-      await writeFileAtomic(quotaPath, JSON.stringify(nextQuota))
-      quota = nextQuota
-    } catch (error) {
-      accepting = false
-      throw error
-    }
+    await writeFileAtomic(quotaPath, JSON.stringify(nextQuota))
+    quota = nextQuota
 
     const id = randomUUID()
     const job = {
-      shareUrl: url,
-      filename: null,
+      shareUrl: input.shareUrl,
+      source: input.file ? 'manual' : 'yandex_disk',
+      filename: input.file?.originalname ?? null,
       createdAt: new Date().toISOString(),
       status: 'processing',
-      stage: 'downloading',
+      stage: input.file ? 'validating' : 'downloading',
       transcript: null,
       summary: null,
       error: null,
       expiresAt: null,
     }
     jobs.set(id, job)
-    void processDemoJob(id, url, job)
-    return response.status(202).json({ id, createdAt: job.createdAt })
-  } catch (error) {
-    if (error instanceof VideoValidationError) return response.status(error.status).json({ error: error.message })
-    console.error('Could not accept demo job:', error.code ?? error.name)
-    return response.status(503).json({ error: 'Не удалось запустить демо-анализ.' })
+    accepted = true
+    void processDemoJob(id, input, job)
+    return response.status(202).json({ id, createdAt: job.createdAt, source: job.source, stage: job.stage })
+  } finally {
+    if (!accepted) {
+      if (input?.file) await removeMeetingFiles(input.file.path)
+      accepting = false
+    }
   }
-})
+}
 
 function requireDemoJob(request, response, next) {
   const token = /^Bearer ([a-f0-9-]{36})$/.exec(request.get('Authorization') ?? '')?.[1]
@@ -120,16 +161,26 @@ app.delete('/api/demo/result', requireDemoJob, (_request, response) => {
 })
 
 app.use((error, _request, response, next) => {
+  if (response.headersSent) return next(error)
+  if (response.destroyed) return
+  if (error instanceof VideoValidationError) return response.status(error.status).json({ error: error.message })
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return response.status(413).json({ error: 'Размер видео превышает 100 МБ.' })
+    }
+    return response.status(400).json({ error: 'Выберите один видеофайл для загрузки.' })
+  }
   if (error.type === 'entity.too.large') return response.status(413).json({ error: 'Ссылка слишком длинная.' })
   if (error.type === 'entity.parse.failed') return response.status(400).json({ error: 'Передайте ссылку в поле url.' })
-  return next(error)
+  console.error('Could not accept demo job:', error.code ?? error.name)
+  return response.status(503).json({ error: 'Не удалось запустить демо-анализ.' })
 })
 
-async function processDemoJob(id, url, job) {
-  const videoPath = join(tempDir, id)
+async function processDemoJob(id, input, job) {
+  const videoPath = input.file?.path ?? join(tempDir, id)
   const signal = AbortSignal.timeout(330_000)
   try {
-    const file = await downloadYandexVideo(url, videoPath, signal, undefined, {
+    const file = input.file ?? await downloadYandexVideo(input.shareUrl, videoPath, signal, undefined, {
       maxBytes,
       onFilename: filename => { job.filename = filename },
     })

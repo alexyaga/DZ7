@@ -9,6 +9,7 @@ import '@fontsource/manrope/latin-700.css'
 import '@fontsource/manrope/latin-800.css'
 import { MeetingSummary } from './MeetingSummary.jsx'
 import { PublicDemo } from './PublicDemo.jsx'
+import { meetingSourceLabels } from './meetingSources.js'
 import './styles.css'
 
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001'
@@ -195,6 +196,7 @@ function App() {
                 }}>
                   <strong>{item.filename}</strong>
                   <span className="meeting-date">{dateFormat.format(new Date(item.createdAt))}</span>
+                  <span className="meeting-date">{meetingSourceLabels[item.source]}</span>
                   <span className="status-pill" data-status={item.status}>{statusLabel(item)}</span>
                 </button>
               </li>
@@ -262,7 +264,7 @@ function App() {
               <div className="panel-heading">
                 <h2 id="selected-title"><Video size={19} aria-hidden="true" /> {selectedMeeting.filename}</h2>
                 <div className="meeting-actions">
-                  {selectedMeeting.source === 'yandex_disk' && <span className="meeting-date">Яндекс Диск</span>}
+                  <span className="meeting-date">{meetingSourceLabels[selectedMeeting.source]}</span>
                   <p className="status-pill" data-status={selectedMeeting.status} role="status">{statusLabel(selectedMeeting)}</p>
                   {selectedMeeting.status !== 'processing' && confirmDeleteId !== selectedMeeting.id && (
                     <button className="delete-button" type="button" disabled={deleting} onClick={() => {

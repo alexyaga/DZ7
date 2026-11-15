@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react'
-import { BrainCircuit, History, Link2, Trash2, Video } from 'lucide-react'
+import { BrainCircuit, History, Link2, Trash2, Upload, Video } from 'lucide-react'
 import { MeetingSummary } from './MeetingSummary.jsx'
+import { meetingSourceLabels } from './meetingSources.js'
 
 const apiUrl = import.meta.env.VITE_DEMO_API_URL
+const maxUploadBytes = 100_000_000
 const tokenKey = 'meeting-analyzer-demo-job'
 const historyKey = 'meeting-analyzer-demo-history'
 const dateFormat = new Intl.DateTimeFormat('ru', { dateStyle: 'medium', timeStyle: 'short' })
@@ -22,14 +24,16 @@ function readHistory() {
     if (previousId && !entries.some(entry => entry.id === previousId)) {
       entries.unshift({ id: previousId, status: 'processing' })
     }
-    return entries.filter(entry => !entry.expiresAt || Date.parse(entry.expiresAt) > Date.now())
+    return entries
+      .filter(entry => !entry.expiresAt || Date.parse(entry.expiresAt) > Date.now())
+      .map(entry => ({ ...entry, source: entry.source ?? 'yandex_disk' }))
   } catch {
     return []
   }
 }
 
 function meetingName(meeting) {
-  return meeting.filename || 'Запись с Яндекс Диска'
+  return meeting.filename || (meeting.source === 'manual' ? 'Локальная запись' : 'Запись с Яндекс Диска')
 }
 const example = {
   summary: 'Команда согласовала обновление инструкции по запуску.',
@@ -103,9 +107,9 @@ export function PublicDemo() {
       if (!response.ok) throw new Error('Demo unavailable')
       const result = await response.json()
       if (controller.signal.aborted) return
-      const { filename, createdAt, status, stage, expiresAt } = result
+      const { filename, createdAt, source, status, stage, expiresAt } = result
       setHistory(entries => entries.map(entry => entry.id === id
-        ? { id, filename, createdAt: createdAt || entry.createdAt, status, stage, expiresAt }
+        ? { id, filename, createdAt: createdAt || entry.createdAt, source: source ?? entry.source, status, stage, expiresAt }
         : entry))
       if (id === selectedId) setDetail({ ...result, id })
       return status === 'processing'
@@ -130,19 +134,34 @@ export function PublicDemo() {
     }
   }, [selectedId, activeId])
 
-  async function submit(event) {
+  async function submit(event, source) {
     event.preventDefault()
     if (!apiUrl || busy) return
+    const form = event.currentTarget
+    const formData = new FormData(form)
+    const isUpload = source === 'manual'
+    const file = isUpload ? formData.get('video') : null
+    if (isUpload && (!file?.size || file.size > maxUploadBytes)) {
+      setMessage(file?.size ? 'Размер видео превышает 100 МБ.' : 'Выберите непустой видеофайл.')
+      return
+    }
+
     setSubmitting(true)
-    setMessage('Проверяем ссылку…')
-    const url = new FormData(event.currentTarget).get('url')
+    setMessage(isUpload ? 'Загружаем видео с компьютера…' : 'Проверяем ссылку…')
     try {
-      const response = await fetch(new URL('/api/demo/jobs', apiUrl), {
+      const response = await fetch(new URL(isUpload ? '/api/demo/jobs/upload' : '/api/demo/jobs', apiUrl), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, knownIds: history.map(entry => entry.id) }),
-        signal: AbortSignal.timeout(12_000),
+        headers: isUpload ? undefined : { 'Content-Type': 'application/json' },
+        body: isUpload ? formData : JSON.stringify({
+          url: formData.get('url'),
+          knownIds: history.map(entry => entry.id),
+        }),
+        signal: AbortSignal.timeout(isUpload ? 300_000 : 12_000),
       })
+      if (isUpload && response.status === 413) {
+        setMessage('Сервер отклонил загрузку из-за размера. Выберите файл меньшего размера.')
+        return
+      }
       const result = await response.json()
       if (response.status === 200 && result.duplicate) {
         selectMeeting(result.id)
@@ -154,13 +173,23 @@ export function PublicDemo() {
         return
       }
       setHistory(entries => [
-        { id: result.id, createdAt: result.createdAt, status: 'processing', stage: 'downloading' },
+        {
+          id: result.id,
+          filename: file?.name,
+          createdAt: result.createdAt,
+          source: result.source ?? source,
+          status: 'processing',
+          stage: result.stage ?? (isUpload ? 'validating' : 'downloading'),
+        },
         ...entries,
       ])
+      if (isUpload) form.reset()
       selectMeeting(result.id)
       setMessage('')
-    } catch {
-      setMessage('Сервер демо недоступен. Готовый пример можно открыть ниже.')
+    } catch (error) {
+      setMessage(isUpload && error.name === 'TimeoutError'
+        ? 'Загрузка заняла слишком много времени. Попробуйте загрузить файл меньшего размера.'
+        : 'Сервер демо недоступен. Готовый пример можно открыть ниже.')
     } finally {
       setSubmitting(false)
     }
@@ -214,6 +243,7 @@ export function PublicDemo() {
                 <button type="button" aria-pressed={entry.id === selectedId} onClick={() => selectMeeting(entry.id)}>
                   <strong>{meetingName(entry)}</strong>
                   {entry.createdAt && <span className="meeting-date">{dateFormat.format(new Date(entry.createdAt))}</span>}
+                  <span className="meeting-date">{meetingSourceLabels[entry.source]}</span>
                   <span className="status-pill" data-status={entry.status}>{statusText[entry.status]}</span>
                 </button>
               </li>
@@ -226,28 +256,39 @@ export function PublicDemo() {
       <main className="content demo-content">
         <div className="page-heading">
           <h1>Анализ записи встречи</h1>
-          <p>Загрузите запись с Яндекс Диска и получите расшифровку и конспект.</p>
+          <p>Загрузите видео с компьютера или Яндекс Диска и получите расшифровку и конспект.</p>
         </div>
         <section className="panel" aria-labelledby="demo-import">
           <div className="panel-heading">
-            <h2 id="demo-import"><Link2 size={19} aria-hidden="true" /> Импорт с Яндекс Диска</h2>
+            <h2 id="demo-import"><Video size={19} aria-hidden="true" /> Загрузка записи</h2>
           </div>
-          <form className="panel-body import-form" onSubmit={submit}>
-            <label htmlFor="demo-link">Публичная ссылка на видео</label>
-            <div className="import-fields">
-              <input id="demo-link" name="url" type="url" required maxLength={2048} disabled={!apiUrl || busy}
-                placeholder="https://disk.yandex.ru/d/…" aria-describedby="demo-hint" />
-              <button type="submit" className="upload-button" disabled={!apiUrl || busy}>Начать анализ</button>
-            </div>
+          <div className="panel-body demo-intake">
+            <form className="import-form" onSubmit={event => submit(event, 'yandex_disk')}>
+              <label htmlFor="demo-link"><Link2 size={15} aria-hidden="true" /> Публичная ссылка на Яндекс Диск</label>
+              <div className="import-fields">
+                <input id="demo-link" name="url" type="url" required maxLength={2048} disabled={!apiUrl || busy}
+                  placeholder="https://disk.yandex.ru/d/…" aria-describedby="demo-hint" />
+                <button type="submit" className="upload-button" disabled={!apiUrl || busy}>Импортировать</button>
+              </div>
+            </form>
+            <form className="import-form" onSubmit={event => submit(event, 'manual')}>
+              <label htmlFor="demo-file"><Upload size={15} aria-hidden="true" /> Видео с компьютера</label>
+              <div className="import-fields">
+                <input id="demo-file" name="video" type="file" required accept=".mp4,.webm" disabled={!apiUrl || busy}
+                  aria-describedby="demo-hint" />
+                <button type="submit" className="upload-button" disabled={!apiUrl || busy}>Загрузить файл</button>
+              </div>
+            </form>
             <p id="demo-hint">MP4 или WebM до 5 минут и 100 МБ. Аудио и текст отправляются в OpenAI. Результат доступен в этой вкладке до часа.</p>
-            <p className="upload-message" role="status">{connectionError || message || (!apiUrl && 'Живой импорт пока недоступен.')}</p>
-          </form>
+            <p className="upload-message" role="status">{connectionError || message || (!apiUrl && 'Загрузка пока недоступна.')}</p>
+          </div>
         </section>
         {selected && (
           <section className="panel" aria-labelledby="demo-meeting-title" key={selectedId}>
             <div className="panel-heading">
               <h2 id="demo-meeting-title"><Video size={19} aria-hidden="true" /> {meetingName(selected)}</h2>
               <div className="meeting-actions">
+                <span className="meeting-date">{meetingSourceLabels[selected.source]}</span>
                 <p className="status-pill" data-status={selected.status} role="status">
                   {statusText[selected.status]}
                 </p>
