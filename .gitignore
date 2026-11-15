@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+data/
+tmp/
+*.mp4
+*.webm
+*.mp3
+*.wav
+*.log
