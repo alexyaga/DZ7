@@ -12,6 +12,15 @@ import { downloadYandexVideo, parseShareUrl } from './yandexDisk.js'
 const maxBytes = 100_000_000
 const maxDurationSeconds = 300
 const dailyLimit = 10
+const dailyBonus = Number(process.env.DEMO_DAILY_BONUS ?? 0)
+const dailyBonusUntil = Date.parse(process.env.DEMO_DAILY_BONUS_UNTIL ?? '')
+
+function currentDailyLimit(now) {
+  return Number.isSafeInteger(dailyBonus) && dailyBonus > 0
+    && Number.isSafeInteger(dailyLimit + dailyBonus) && now.getTime() < dailyBonusUntil
+    ? dailyLimit + dailyBonus
+    : dailyLimit
+}
 const resultLifetimeMs = 60 * 60 * 1000
 const dataDir = resolve('data', 'public-demo')
 const quotaPath = join(dataDir, 'quota.json')
@@ -49,9 +58,10 @@ app.post('/api/demo/jobs', express.json({ limit: '4kb' }), async (request, respo
     if (duplicateId) return response.json({ id: duplicateId, duplicate: true })
 
     if (accepting) return response.status(409).json({ error: 'Сейчас обрабатывается другая запись. Попробуйте позже.' })
-    const day = new Date().toISOString().slice(0, 10)
+    const now = new Date()
+    const day = now.toISOString().slice(0, 10)
     const count = quota.day === day ? quota.count : 0
-    if (count >= dailyLimit) {
+    if (count >= currentDailyLimit(now)) {
       return response.status(429).json({ error: 'Лимит демо на сегодня исчерпан. Готовый пример доступен ниже.' })
     }
 
@@ -160,3 +170,4 @@ try {
 }
 ready = true
 console.log(`Public demo API: http://127.0.0.1:${server.address().port}`)
+console.log(`Public demo daily limit at startup: ${currentDailyLimit(new Date())}`)
