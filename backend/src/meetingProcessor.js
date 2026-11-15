@@ -17,16 +17,21 @@ export async function removeMeetingFiles(videoPath) {
 }
 
 export async function processMeeting(meetingId, videoPath) {
+  const result = await analyzeMeeting(videoPath, changes => updateMeeting(meetingId, changes))
+  await updateMeeting(meetingId, result)
+}
+
+export async function analyzeMeeting(videoPath, report, { maxDurationSeconds } = {}) {
   const audioPath = videoPath + '.mp3'
   let failure
   let summary = null
 
   try {
     await access(videoPath)
-    const { isSilent } = await extractAudio(videoPath, audioPath)
-    if (!isSilent) await updateMeeting(meetingId, { stage: 'transcribing' })
+    const { isSilent } = await extractAudio(videoPath, audioPath, { maxDurationSeconds })
+    if (!isSilent) await report({ stage: 'transcribing' })
     const transcript = isSilent ? '' : await transcribeAudio(audioPath)
-    await updateMeeting(meetingId, { transcript, stage: transcript.trim() ? 'summarizing' : null })
+    await report({ transcript, stage: transcript.trim() ? 'summarizing' : null })
     summary = await generateMeetingSummary(transcript)
   } catch (error) {
     if (error instanceof AudioExtractionError || error instanceof TranscriptionError || error instanceof SummaryError) {
@@ -39,10 +44,10 @@ export async function processMeeting(meetingId, videoPath) {
     await removeMeetingFiles(videoPath)
   }
 
-  await updateMeeting(meetingId, {
+  return {
     status: failure ? 'error' : 'completed',
     stage: null,
     summary,
     error: failure ?? null,
-  })
+  }
 }

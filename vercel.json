@@ -1,0 +1,4 @@
+{
+  "buildCommand": "VITE_PUBLIC_DEMO=true pnpm build",
+  "outputDirectory": "frontend/dist"
+}

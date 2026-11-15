@@ -8,7 +8,7 @@ const publicApi = 'https://cloud-api.yandex.net/v1/disk/public/resources'
 const shareHosts = ['disk.yandex.ru', 'disk.yandex.com', 'yadi.sk']
 const redirectStatuses = new Set([301, 302, 303, 307, 308])
 
-function parseShareUrl(value) {
+export function parseShareUrl(value) {
   const url = typeof value === 'string' && value.length <= 2048 ? URL.parse(value.trim()) : null
   if (!url || url.protocol !== 'https:' || !shareHosts.includes(url.hostname)
     || url.username || url.password || url.port || !/^\/(d|i)\/[\w-]+\/?$/.test(url.pathname)) {
@@ -58,12 +58,11 @@ async function getDownload(href, signal) {
   throw new VideoValidationError(502, 'Яндекс Диск вернул неподдерживаемый адрес скачивания.')
 }
 
-function checkSize(bytes) {
-  if (bytes > maxVideoBytes) throw new VideoValidationError(413, 'Размер видео превышает 750 МБ.')
-}
-
-export async function downloadYandexVideo(link, path, signal, findDuplicate) {
+export async function downloadYandexVideo(link, path, signal, findDuplicate, { maxBytes = maxVideoBytes } = {}) {
   const shareUrl = parseShareUrl(link)
+  function checkSize(bytes) {
+    if (bytes > maxBytes) throw new VideoValidationError(413, `Размер видео превышает ${maxBytes / 1_000_000} МБ.`)
+  }
   const deadline = AbortSignal.timeout(300_000)
   const downloadSignal = AbortSignal.any([signal, deadline])
   let outputStarted = false

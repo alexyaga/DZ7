@@ -11,7 +11,7 @@ export class AudioExtractionError extends Error {
 }
 
 // The caller owns the temporary output and removes it after use or failure.
-export async function extractAudio(videoPath, audioPath, { signal, timeoutMs = 120_000 } = {}) {
+export async function extractAudio(videoPath, audioPath, { signal, timeoutMs = 120_000, maxDurationSeconds } = {}) {
   const deadline = AbortSignal.timeout(timeoutMs)
   const conversionSignal = signal ? AbortSignal.any([signal, deadline]) : deadline
   const processHandle = spawn(process.env.FFMPEG_PATH || 'ffmpeg', [
@@ -19,6 +19,7 @@ export async function extractAudio(videoPath, audioPath, { signal, timeoutMs = 1
     '-abort_on', 'empty_output',
     '-protocol_whitelist', 'file',
     '-i', videoPath,
+    ...(maxDurationSeconds ? ['-t', String(maxDurationSeconds)] : []),
     '-map', '0:a:0',
     '-vn', '-sn', '-dn',
     '-ac', '1', '-ar', '16000',

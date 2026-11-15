@@ -8,6 +8,7 @@ import '@fontsource/manrope/latin-400.css'
 import '@fontsource/manrope/latin-700.css'
 import '@fontsource/manrope/latin-800.css'
 import { MeetingSummary } from './MeetingSummary.jsx'
+import { PublicDemo } from './PublicDemo.jsx'
 import './styles.css'
 
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001'
@@ -313,4 +314,4 @@ function App() {
   )
 }
 
-createRoot(document.getElementById('root')).render(<App />)
+createRoot(document.getElementById('root')).render(import.meta.env.VITE_PUBLIC_DEMO === 'true' ? <PublicDemo /> : <App />)

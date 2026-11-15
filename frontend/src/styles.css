@@ -277,6 +277,10 @@ button, input { font: inherit; }
 .import-fields .upload-button { margin-top: 0; cursor: pointer; }
 .import-fields .upload-button:disabled { cursor: default; }
 #import-hint { margin-top: 7px; color: var(--muted); font-size: 12px; }
+.demo-content { max-width: 1050px; min-height: calc(100dvh - 66px); }
+#demo-hint { margin-top: 7px; color: var(--muted); font-size: 12px; }
+.demo-example { padding: 14px 20px; }
+.demo-example > summary { color: var(--purple); cursor: pointer; font-weight: 700; }
 
 .panel {
   margin-top: 18px;

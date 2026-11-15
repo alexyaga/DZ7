@@ -8,6 +8,7 @@
   "packageManager": "pnpm@11.25.0",
   "scripts": {
     "dev:backend": "node --use-system-ca --env-file-if-exists=.env --watch backend/src/server.js",
+    "dev:demo": "node --use-system-ca --env-file-if-exists=.env backend/src/demoServer.js",
     "dev:frontend": "vite --config frontend/vite.config.js",
     "build": "vite build --config frontend/vite.config.js"
   },

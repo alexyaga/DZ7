@@ -1,3 +1,4 @@
+import { useId } from 'react'
 import { Sparkles } from 'lucide-react'
 
 function SummaryList({ title, items }) {
@@ -12,10 +13,11 @@ function SummaryList({ title, items }) {
 }
 
 export function MeetingSummary({ summary }) {
+  const titleId = useId()
   return (
-    <section className="panel" aria-labelledby="summary-title">
+    <section className="panel" aria-labelledby={titleId}>
       <div className="panel-heading">
-        <h2 id="summary-title"><Sparkles size={19} aria-hidden="true" /> Конспект встречи</h2>
+        <h2 id={titleId}><Sparkles size={19} aria-hidden="true" /> Конспект встречи</h2>
       </div>
       <div className="panel-body summary-grid">
         <div className="summary-block">
