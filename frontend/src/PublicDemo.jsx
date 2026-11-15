@@ -134,16 +134,21 @@ export function PublicDemo() {
     event.preventDefault()
     if (!apiUrl || busy) return
     setSubmitting(true)
-    setMessage('Запускаем анализ…')
+    setMessage('Проверяем ссылку…')
     const url = new FormData(event.currentTarget).get('url')
     try {
       const response = await fetch(new URL('/api/demo/jobs', apiUrl), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url }),
+        body: JSON.stringify({ url, knownIds: history.map(entry => entry.id) }),
         signal: AbortSignal.timeout(12_000),
       })
       const result = await response.json()
+      if (response.status === 200 && result.duplicate) {
+        selectMeeting(result.id)
+        setMessage('Эта запись уже есть в истории. Открыта существующая встреча.')
+        return
+      }
       if (response.status !== 202) {
         setMessage(result.error || 'Не удалось запустить демо-анализ.')
         return

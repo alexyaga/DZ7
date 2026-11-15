@@ -38,6 +38,16 @@ app.get('/api/demo/health', (_request, response) => response.json({ status: 'ok'
 app.post('/api/demo/jobs', express.json({ limit: '4kb' }), async (request, response) => {
   try {
     const url = parseShareUrl(request.body?.url)
+    const knownIds = Array.isArray(request.body?.knownIds) ? request.body.knownIds : []
+    // Look up only results whose private identifiers the browser already holds.
+    const duplicateId = knownIds.find(id => {
+      const job = jobs.get(id)
+      return job?.shareUrl === url
+        && (job.status !== 'error' || typeof job.transcript === 'string')
+        && (!job.expiresAt || Date.parse(job.expiresAt) > Date.now())
+    })
+    if (duplicateId) return response.json({ id: duplicateId, duplicate: true })
+
     if (accepting) return response.status(409).json({ error: 'Сейчас обрабатывается другая запись. Попробуйте позже.' })
     const day = new Date().toISOString().slice(0, 10)
     const count = quota.day === day ? quota.count : 0
@@ -57,6 +67,7 @@ app.post('/api/demo/jobs', express.json({ limit: '4kb' }), async (request, respo
 
     const id = randomUUID()
     const job = {
+      shareUrl: url,
       filename: null,
       createdAt: new Date().toISOString(),
       status: 'processing',
@@ -86,7 +97,8 @@ function requireDemoJob(request, response, next) {
 }
 
 app.get('/api/demo/result', requireDemoJob, (_request, response) => {
-  return response.json(response.locals.demoJob)
+  const { shareUrl, ...result } = response.locals.demoJob
+  return response.json(result)
 })
 
 app.delete('/api/demo/result', requireDemoJob, (_request, response) => {
