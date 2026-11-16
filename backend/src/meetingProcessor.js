@@ -4,11 +4,10 @@ import { updateMeeting } from './meetingRepository.js'
 import { generateMeetingSummary, SummaryError } from './summaryService.js'
 import { transcribeAudio, TranscriptionError } from './transcriptionService.js'
 
-export async function removeMeetingFiles(videoPath) {
-  const results = await Promise.allSettled([
-    rm(videoPath, { force: true }),
-    rm(videoPath + '.mp3', { force: true }),
-  ])
+export async function removeMeetingFiles(videoPath, { keepVideo = false } = {}) {
+  const paths = [videoPath + '.mp3']
+  if (!keepVideo) paths.push(videoPath)
+  const results = await Promise.allSettled(paths.map(path => rm(path, { force: true })))
   for (const result of results) {
     if (result.status === 'rejected') {
       console.error('Could not remove temporary meeting file:', result.reason.code)
@@ -21,7 +20,7 @@ export async function processMeeting(meetingId, videoPath) {
   await updateMeeting(meetingId, result)
 }
 
-export async function analyzeMeeting(videoPath, report, { maxDurationSeconds } = {}) {
+export async function analyzeMeeting(videoPath, report, { maxDurationSeconds, keepVideo } = {}) {
   const audioPath = videoPath + '.mp3'
   let failure
   let summary = null
@@ -41,7 +40,7 @@ export async function analyzeMeeting(videoPath, report, { maxDurationSeconds } =
       failure = 'Не удалось обработать запись.'
     }
   } finally {
-    await removeMeetingFiles(videoPath)
+    await removeMeetingFiles(videoPath, { keepVideo })
   }
 
   return {

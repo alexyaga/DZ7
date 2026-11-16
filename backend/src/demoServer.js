@@ -1,32 +1,24 @@
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
-import { mkdir, readdir, readFile } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+import { mkdir, readdir, readFile, rename } from 'node:fs/promises'
+import { join } from 'node:path'
 import cors from 'cors'
 import express from 'express'
 import multer from 'multer'
 import writeFileAtomic from 'write-file-atomic'
+import {
+  createDemoJob, deleteDemoJob, demoDataDir, demoVideoPath, findDemoJobByLink,
+  getDemoJob, initializeDemoJobs, listDemoJobs, saveDemoJob,
+} from './demoRepository.js'
 import { analyzeMeeting, removeMeetingFiles } from './meetingProcessor.js'
 import { validateVideo, videoExtension, VideoValidationError } from './videoValidation.js'
 import { downloadYandexVideo, parseShareUrl } from './yandexDisk.js'
 
 const maxBytes = 100_000_000
 const maxDurationSeconds = 300
-const dailyLimit = 10
-const dailyBonus = Number(process.env.DEMO_DAILY_BONUS ?? 0)
-const dailyBonusUntil = Date.parse(process.env.DEMO_DAILY_BONUS_UNTIL ?? '')
-
-function currentDailyLimit(now) {
-  return Number.isSafeInteger(dailyBonus) && dailyBonus > 0
-    && Number.isSafeInteger(dailyLimit + dailyBonus) && now.getTime() < dailyBonusUntil
-    ? dailyLimit + dailyBonus
-    : dailyLimit
-}
-const resultLifetimeMs = 60 * 60 * 1000
-const dataDir = resolve('data', 'public-demo')
-const quotaPath = join(dataDir, 'quota.json')
-const tempDir = join(dataDir, 'tmp')
-const jobs = new Map()
+const dailyLimit = 100
+const quotaPath = join(demoDataDir, 'quota.json')
+const tempDir = join(demoDataDir, 'tmp')
 const clientOrigin = process.env.DEMO_CLIENT_ORIGIN || 'http://localhost:5173'
 let accepting = false
 let ready = false
@@ -62,17 +54,16 @@ app.use((request, response, next) => {
 
 app.get('/api/demo/health', (_request, response) => response.json({ status: 'ok' }))
 
+function meetingInfo({ id, filename, source, createdAt, status, stage, expiresAt, videoFormat }) {
+  return { id, filename, source, createdAt, status, stage, expiresAt, videoFormat }
+}
+
+app.get('/api/demo/jobs', (_request, response) => response.json(listDemoJobs().map(meetingInfo)))
+
 app.post('/api/demo/jobs', express.json({ limit: '4kb' }), async (request, response) => {
   const shareUrl = parseShareUrl(request.body?.url)
-  const knownIds = Array.isArray(request.body?.knownIds) ? request.body.knownIds : []
-  // Look up only results whose private identifiers the browser already holds.
-  const duplicateId = knownIds.find(id => {
-    const job = jobs.get(id)
-    return job?.shareUrl === shareUrl
-      && (job.status !== 'error' || typeof job.transcript === 'string')
-      && (!job.expiresAt || Date.parse(job.expiresAt) > Date.now())
-  })
-  if (duplicateId) return response.json({ id: duplicateId, duplicate: true })
+  const duplicate = findDemoJobByLink(shareUrl)
+  if (duplicate) return response.json({ ...meetingInfo(duplicate), duplicate: true })
 
   return acceptDemoJob(response, async () => ({ shareUrl }))
 })
@@ -99,7 +90,7 @@ async function acceptDemoJob(response, receiveSource) {
   const now = new Date()
   const day = now.toISOString().slice(0, 10)
   const count = quota.day === day ? quota.count : 0
-  if (count >= currentDailyLimit(now)) {
+  if (count >= dailyLimit) {
     return response.status(429).json({ error: 'Лимит демо на сегодня исчерпан. Готовый пример доступен ниже.' })
   }
 
@@ -115,6 +106,8 @@ async function acceptDemoJob(response, receiveSource) {
 
     const id = randomUUID()
     const job = {
+      id,
+      deleteToken: randomUUID(),
       shareUrl: input.shareUrl,
       source: input.file ? 'manual' : 'yandex_disk',
       filename: input.file?.originalname ?? null,
@@ -124,12 +117,12 @@ async function acceptDemoJob(response, receiveSource) {
       transcript: null,
       summary: null,
       error: null,
-      expiresAt: null,
+      videoFormat: null,
     }
-    jobs.set(id, job)
+    await createDemoJob(job)
     accepted = true
-    void processDemoJob(id, input, job)
-    return response.status(202).json({ id, createdAt: job.createdAt, source: job.source, stage: job.stage })
+    void processDemoJob(input, job)
+    return response.status(202).json({ ...meetingInfo(job), deleteToken: job.deleteToken })
   } finally {
     if (!accepted) {
       if (input?.file) await removeMeetingFiles(input.file.path)
@@ -139,24 +132,35 @@ async function acceptDemoJob(response, receiveSource) {
 }
 
 function requireDemoJob(request, response, next) {
-  const token = /^Bearer ([a-f0-9-]{36})$/.exec(request.get('Authorization') ?? '')?.[1]
-  const job = jobs.get(token)
+  const job = getDemoJob(request.params.id)
   if (!job) return response.status(404).json({ error: 'Результат недоступен или срок хранения истёк.' })
   response.locals.demoJob = job
-  response.locals.demoToken = token
   return next()
 }
 
-app.get('/api/demo/result', requireDemoJob, (_request, response) => {
-  const { shareUrl, ...result } = response.locals.demoJob
-  return response.json(result)
+app.get('/api/demo/jobs/:id', requireDemoJob, (_request, response) => {
+  const job = response.locals.demoJob
+  const { transcript, summary, error } = job
+  return response.json({ ...meetingInfo(job), transcript, summary, error })
 })
 
-app.delete('/api/demo/result', requireDemoJob, (_request, response) => {
-  if (response.locals.demoJob.status === 'processing') {
+app.get('/api/demo/jobs/:id/video', requireDemoJob, (_request, response) => {
+  const { id, videoFormat } = response.locals.demoJob
+  if (!videoFormat) return response.status(404).json({ error: 'Видео недоступно.' })
+  response.type(videoFormat === 'mp4' ? 'video/mp4' : 'video/webm')
+  response.set('X-Content-Type-Options', 'nosniff')
+  return response.sendFile(demoVideoPath(id, videoFormat))
+})
+
+app.delete('/api/demo/jobs/:id', requireDemoJob, async (request, response) => {
+  const job = response.locals.demoJob
+  if (!job.deleteToken || request.get('Authorization') !== `Bearer ${job.deleteToken}`) {
+    return response.status(403).json({ error: 'Удалить встречу может только тот, кто её загрузил.' })
+  }
+  if (job.status === 'processing') {
     return response.status(409).json({ error: 'Дождитесь завершения обработки встречи.' })
   }
-  jobs.delete(response.locals.demoToken)
+  await deleteDemoJob(job)
   return response.status(204).end()
 })
 
@@ -176,37 +180,49 @@ app.use((error, _request, response, next) => {
   return response.status(503).json({ error: 'Не удалось запустить демо-анализ.' })
 })
 
-async function processDemoJob(id, input, job) {
-  const videoPath = input.file?.path ?? join(tempDir, id)
+async function processDemoJob(input, job) {
+  const stagingPath = input.file?.path ?? join(tempDir, job.id)
   const signal = AbortSignal.timeout(330_000)
   try {
-    const file = input.file ?? await downloadYandexVideo(input.shareUrl, videoPath, signal, undefined, {
-      maxBytes,
-      onFilename: filename => { job.filename = filename },
-    })
+    const file = input.file ?? await downloadYandexVideo(input.shareUrl, stagingPath, signal, undefined, { maxBytes })
+    job.filename = file.originalname
     job.stage = 'validating'
-    const { durationSeconds } = await validateVideo(file, videoExtension(file.originalname), signal)
+    await saveDemoJob(job)
+    const extension = videoExtension(file.originalname)
+    const { durationSeconds } = await validateVideo(file, extension, signal)
     if (durationSeconds > maxDurationSeconds) {
       throw new VideoValidationError(422, 'Для демо нужна запись длительностью до 5 минут.')
     }
+    const videoPath = demoVideoPath(job.id, extension)
+    await rename(stagingPath, videoPath)
+    job.videoFormat = extension
     job.stage = 'extracting'
-    Object.assign(job, await analyzeMeeting(videoPath, changes => Object.assign(job, changes), { maxDurationSeconds }))
+    await saveDemoJob(job)
+    Object.assign(job, await analyzeMeeting(videoPath, async changes => {
+      Object.assign(job, changes)
+      await saveDemoJob(job)
+    }, { maxDurationSeconds, keepVideo: true }))
   } catch (error) {
-    await removeMeetingFiles(videoPath)
+    await removeMeetingFiles(stagingPath)
     job.status = 'error'
     job.stage = null
     job.error = error instanceof VideoValidationError ? error.message : 'Не удалось обработать запись.'
     if (!(error instanceof VideoValidationError)) console.error('Demo processing failed:', error.code ?? error.name)
   } finally {
-    job.expiresAt = new Date(Date.now() + resultLifetimeMs).toISOString()
-    accepting = false
-    setTimeout(() => jobs.delete(id), resultLifetimeMs).unref()
+    try {
+      await saveDemoJob(job)
+    } catch (error) {
+      console.error('Could not save demo meeting:', error.code ?? error.name)
+    } finally {
+      accepting = false
+    }
   }
 }
 
 const server = app.listen(Number(process.env.DEMO_PORT ?? 3002), '127.0.0.1')
 await once(server, 'listening')
 await mkdir(tempDir, { recursive: true })
+await initializeDemoJobs()
 for (const filename of await readdir(tempDir)) {
   if (/^[a-f0-9-]{36}$/.test(filename)) await removeMeetingFiles(join(tempDir, filename))
   if (/^[a-f0-9-]{36}\.mp3$/.test(filename)) await removeMeetingFiles(join(tempDir, filename.slice(0, -4)))
@@ -221,4 +237,4 @@ try {
 }
 ready = true
 console.log(`Public demo API: http://127.0.0.1:${server.address().port}`)
-console.log(`Public demo daily limit at startup: ${currentDailyLimit(new Date())}`)
+console.log(`Public demo daily limit: ${dailyLimit}`)

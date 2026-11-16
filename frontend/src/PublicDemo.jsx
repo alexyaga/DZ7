@@ -5,8 +5,7 @@ import { meetingSourceLabels } from './meetingSources.js'
 
 const apiUrl = import.meta.env.VITE_DEMO_API_URL
 const maxUploadBytes = 100_000_000
-const tokenKey = 'meeting-analyzer-demo-job'
-const historyKey = 'meeting-analyzer-demo-history'
+const deleteKeysStorage = 'meeting-analyzer-demo-delete-keys'
 const dateFormat = new Intl.DateTimeFormat('ru', { dateStyle: 'medium', timeStyle: 'short' })
 const stageText = {
   downloading: 'Скачиваем видео…',
@@ -17,18 +16,12 @@ const stageText = {
 }
 const statusText = { processing: 'Обрабатывается', completed: 'Готово', error: 'Ошибка' }
 
-function readHistory() {
+function readDeleteKeys() {
   try {
-    const entries = JSON.parse(sessionStorage.getItem(historyKey) || '[]')
-    const previousId = sessionStorage.getItem(tokenKey)
-    if (previousId && !entries.some(entry => entry.id === previousId)) {
-      entries.unshift({ id: previousId, status: 'processing' })
-    }
-    return entries
-      .filter(entry => !entry.expiresAt || Date.parse(entry.expiresAt) > Date.now())
-      .map(entry => ({ ...entry, source: entry.source ?? 'yandex_disk' }))
+    const keys = JSON.parse(localStorage.getItem(deleteKeysStorage) ?? '{}')
+    return Object.fromEntries(Object.entries(keys).filter(([, key]) => Date.parse(key?.expiresAt) > Date.now()))
   } catch {
-    return []
+    return {}
   }
 }
 
@@ -57,8 +50,9 @@ function Result({ transcript, summary }) {
 }
 
 export function PublicDemo() {
-  const [history, setHistory] = useState(readHistory)
-  const [selection, setSelection] = useState(null)
+  const [history, setHistory] = useState([])
+  const [deleteKeys, setDeleteKeys] = useState(readDeleteKeys)
+  const [selection, setSelection] = useState(() => new URLSearchParams(location.search).get('meeting'))
   const [detail, setDetail] = useState(null)
   const [submitting, setSubmitting] = useState(false)
   const [message, setMessage] = useState('')
@@ -66,65 +60,40 @@ export function PublicDemo() {
   const [confirmationId, setConfirmationId] = useState(null)
   const [deleting, setDeleting] = useState(false)
   const [deleteError, setDeleteError] = useState('')
-  const selected = history.find(entry => entry.id === selection) || history[0]
+  const selected = selection ? history.find(entry => entry.id === selection) : history[0]
   const selectedId = selected?.id
-  const activeId = history.find(entry => entry.status === 'processing')?.id
+  const deleteToken = deleteKeys[selectedId]?.token
   const job = detail?.id === selectedId ? detail : null
   const confirming = Boolean(selectedId && confirmationId === selectedId)
-  const busy = submitting || Boolean(activeId)
+  const busy = submitting || history.some(entry => entry.status === 'processing')
 
   useEffect(() => {
-    sessionStorage.setItem(historyKey, JSON.stringify(history))
-    sessionStorage.removeItem(tokenKey)
-    const expirations = history.filter(entry => entry.expiresAt).map(entry => Date.parse(entry.expiresAt))
-    if (!expirations.length) return
-    const timer = setTimeout(() => {
-      const now = Date.now()
-      setHistory(entries => entries.filter(entry => !entry.expiresAt || Date.parse(entry.expiresAt) > now))
-      setDetail(current => current?.expiresAt && Date.parse(current.expiresAt) <= now ? null : current)
-    }, Math.max(0, Math.min(...expirations) - Date.now()))
-    return () => clearTimeout(timer)
-  }, [history])
+    try {
+      localStorage.setItem(deleteKeysStorage, JSON.stringify(deleteKeys))
+    } catch {
+      // The current page can still delete its uploads when browser storage is unavailable.
+    }
+  }, [deleteKeys])
 
   useEffect(() => {
-    if ((!selectedId && !activeId) || !apiUrl) return
+    if (!apiUrl) return
     const controller = new AbortController()
     let timer
-    const ids = [...new Set([selectedId, activeId].filter(Boolean))]
-
-    async function pollMeeting(id) {
-      const response = await fetch(new URL('/api/demo/result', apiUrl), {
-        headers: { Authorization: `Bearer ${id}` },
-        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]),
-      })
-      if (controller.signal.aborted) return
-      if (response.status === 404) {
-        setHistory(entries => entries.filter(entry => entry.id !== id))
-        setDetail(current => current?.id === id ? null : current)
-        if (id === selectedId) setMessage('Результат недоступен или срок хранения истёк.')
-        return
-      }
-      if (!response.ok) throw new Error('Demo unavailable')
-      const result = await response.json()
-      if (controller.signal.aborted) return
-      const { filename, createdAt, source, status, stage, expiresAt } = result
-      setHistory(entries => entries.map(entry => entry.id === id
-        ? { id, filename, createdAt: createdAt || entry.createdAt, source: source ?? entry.source, status, stage, expiresAt }
-        : entry))
-      if (id === selectedId) setDetail({ ...result, id })
-      return status === 'processing'
-    }
 
     async function poll() {
       try {
-        const statuses = await Promise.all(ids.map(pollMeeting))
+        const response = await fetch(new URL('/api/demo/jobs', apiUrl), {
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]),
+        })
+        if (!response.ok) throw new Error('Demo unavailable')
+        const entries = await response.json()
         if (controller.signal.aborted) return
+        setHistory(entries)
         setConnectionError('')
-        if (!statuses.some(Boolean)) return
       } catch {
         if (!controller.signal.aborted) setConnectionError('Не удаётся связаться с сервером. Повторяем подключение…')
       }
-      if (!controller.signal.aborted) timer = setTimeout(poll, 1800)
+      if (!controller.signal.aborted) timer = setTimeout(poll, 4000)
     }
 
     poll()
@@ -132,7 +101,36 @@ export function PublicDemo() {
       controller.abort()
       clearTimeout(timer)
     }
-  }, [selectedId, activeId])
+  }, [])
+
+  useEffect(() => {
+    if (!apiUrl || !selectedId) return
+    const controller = new AbortController()
+    let timer
+
+    async function poll() {
+      try {
+        const response = await fetch(new URL(`/api/demo/jobs/${selectedId}`, apiUrl), {
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]),
+        })
+        if (response.status === 404) return
+        if (!response.ok) throw new Error('Demo unavailable')
+        const result = await response.json()
+        if (controller.signal.aborted) return
+        setDetail(result)
+        if (result.status !== 'processing') return
+      } catch {
+        if (controller.signal.aborted) return
+      }
+      timer = setTimeout(poll, 1800)
+    }
+
+    poll()
+    return () => {
+      controller.abort()
+      clearTimeout(timer)
+    }
+  }, [selectedId])
 
   async function submit(event, source) {
     event.preventDefault()
@@ -152,10 +150,7 @@ export function PublicDemo() {
       const response = await fetch(new URL(isUpload ? '/api/demo/jobs/upload' : '/api/demo/jobs', apiUrl), {
         method: 'POST',
         headers: isUpload ? undefined : { 'Content-Type': 'application/json' },
-        body: isUpload ? formData : JSON.stringify({
-          url: formData.get('url'),
-          knownIds: history.map(entry => entry.id),
-        }),
+        body: isUpload ? formData : JSON.stringify({ url: formData.get('url') }),
         signal: AbortSignal.timeout(isUpload ? 300_000 : 12_000),
       })
       if (isUpload && response.status === 413) {
@@ -164,6 +159,7 @@ export function PublicDemo() {
       }
       const result = await response.json()
       if (response.status === 200 && result.duplicate) {
+        setHistory(entries => entries.some(entry => entry.id === result.id) ? entries : [...entries, result])
         selectMeeting(result.id)
         setMessage('Эта запись уже есть в истории. Открыта существующая встреча.')
         return
@@ -172,17 +168,9 @@ export function PublicDemo() {
         setMessage(result.error || 'Не удалось запустить демо-анализ.')
         return
       }
-      setHistory(entries => [
-        {
-          id: result.id,
-          filename: file?.name,
-          createdAt: result.createdAt,
-          source: result.source ?? source,
-          status: 'processing',
-          stage: result.stage ?? (isUpload ? 'validating' : 'downloading'),
-        },
-        ...entries,
-      ])
+      const { deleteToken, ...meeting } = result
+      setDeleteKeys(keys => ({ ...keys, [meeting.id]: { token: deleteToken, expiresAt: meeting.expiresAt } }))
+      setHistory(entries => entries.some(entry => entry.id === meeting.id) ? entries : [meeting, ...entries])
       if (isUpload) form.reset()
       selectMeeting(result.id)
       setMessage('')
@@ -196,6 +184,10 @@ export function PublicDemo() {
   }
 
   function selectMeeting(id) {
+    const url = new URL(location.href)
+    if (id) url.searchParams.set('meeting', id)
+    else url.searchParams.delete('meeting')
+    window.history.replaceState(null, '', url)
     setSelection(id)
     setConfirmationId(null)
     setDeleteError('')
@@ -205,9 +197,9 @@ export function PublicDemo() {
     setDeleting(true)
     setDeleteError('')
     try {
-      const response = await fetch(new URL('/api/demo/result', apiUrl), {
+      const response = await fetch(new URL(`/api/demo/jobs/${id}`, apiUrl), {
         method: 'DELETE',
-        headers: { Authorization: `Bearer ${id}` },
+        headers: { Authorization: `Bearer ${deleteToken}` },
         signal: AbortSignal.timeout(12_000),
       })
       if (response.status !== 204 && response.status !== 404) {
@@ -216,8 +208,9 @@ export function PublicDemo() {
         return
       }
       setHistory(entries => entries.filter(entry => entry.id !== id))
+      setDeleteKeys(keys => Object.fromEntries(Object.entries(keys).filter(([key]) => key !== id)))
       setDetail(current => current?.id === id ? null : current)
-      setConfirmationId(null)
+      selectMeeting(null)
       setMessage('Встреча удалена.')
     } catch {
       setDeleteError('Не удалось подтвердить удаление. Проверьте соединение и повторите попытку.')
@@ -234,7 +227,7 @@ export function PublicDemo() {
           <span>AI Meeting Analyzer<small>ПУБЛИЧНАЯ ДЕМОВЕРСИЯ</small></span>
         </div>
         <h2 id="demo-history-title" className="eyebrow history-label">
-          <History size={15} aria-hidden="true" /> История встреч
+          <History size={15} aria-hidden="true" /> Общая история встреч
         </h2>
         {history.length ? (
           <ul className="meeting-list">
@@ -279,7 +272,7 @@ export function PublicDemo() {
                 <button type="submit" className="upload-button" disabled={!apiUrl || busy}>Загрузить файл</button>
               </div>
             </form>
-            <p id="demo-hint">MP4 или WebM до 5 минут и 100 МБ. Аудио и текст отправляются в OpenAI. Результат доступен в этой вкладке до часа.</p>
+            <p id="demo-hint">MP4 или WebM до 5 минут и 100 МБ. Видео, расшифровка и конспект будут видны всем посетителям демо семь дней. Аудио и текст отправляются в OpenAI.</p>
             <p className="upload-message" role="status">{connectionError || message || (!apiUrl && 'Загрузка пока недоступна.')}</p>
           </div>
         </section>
@@ -292,7 +285,7 @@ export function PublicDemo() {
                 <p className="status-pill" data-status={selected.status} role="status">
                   {statusText[selected.status]}
                 </p>
-                {apiUrl && selected.status !== 'processing' && !confirming && (
+                {deleteToken && selected.status !== 'processing' && !confirming && (
                   <button className="delete-button" type="button" disabled={deleting} onClick={() => setConfirmationId(selectedId)}>
                     <Trash2 size={15} aria-hidden="true" /> Удалить встречу
                   </button>
@@ -302,10 +295,16 @@ export function PublicDemo() {
             {selected.status === 'processing' && selected.stage && (
               <p className="panel-body" role="status">{stageText[selected.stage]}</p>
             )}
+            {selected.videoFormat && (
+              <div className="panel-body">
+                <video className="demo-video" controls preload="metadata" aria-label="Видео встречи"
+                  src={new URL(`/api/demo/jobs/${selectedId}/video`, apiUrl).href} />
+              </div>
+            )}
             {job?.error && <p className="meeting-error" role="alert">{job.error}</p>}
             {confirming && (
               <div className="panel-body">
-                <p>Встреча, расшифровка и конспект будут удалены из истории демо.</p>
+                <p>Видео, расшифровка и конспект будут удалены из общей истории.</p>
                 <div className="delete-confirm-actions">
                   <button className="cancel-button" type="button" disabled={deleting} onClick={() => {
                     setConfirmationId(null)
